@@ -180,6 +180,7 @@ namespace dnSpy.Roslyn.Debugger.ExpressionCompiler {
 			info.ParameterNames = GetParameterNames(langDebugInfo.MethodDebugInfo.Method, methodDebugInfo.Parameters);
 			info.LocalConstants = default;
 			info.ReuseSpan = RoslynExpressionCompilerMethods.GetReuseSpan(allScopes, langDebugInfo.ILOffset);
+			info.ContainingDocumentName = null;
 
 			return info;
 		}
@@ -263,7 +264,10 @@ namespace dnSpy.Roslyn.Debugger.ExpressionCompiler {
 				if (!p.IsNormalMethodParameter)
 					continue;
 				var name = TryGetSourceParameter(parameters, i).Name ?? p.Name;
-				if (GetParameterName(i, name) != name) {
+				// Compare the name used in the decompiled code again the name in the .NET metadata
+				// If they are equal, we do not need top provide parameter names to the EE as it will just grab them from the metadata.
+				// If they are different, we need to provide the names to the EE so the parameter names in the Watch window and Locals window are correct.
+				if (GetParameterName(i, name) != p.Name) {
 					valid = false;
 					break;
 				}
@@ -379,7 +383,7 @@ namespace dnSpy.Roslyn.Debugger.ExpressionCompiler {
 			return builder.ToImmutableArray();
 		}
 
-		protected DbgDotNetCompilationResult CreateCompilationResult(string expression, CompileResult compileResult, ResultProperties resultProperties, string? errorMessage, DbgDotNetText name) {
+		protected DbgDotNetCompilationResult CreateCompilationResult(string expression, CompileResult? compileResult, ResultProperties resultProperties, string? errorMessage, DbgDotNetText name) {
 			if (errorMessage is not null)
 				return new DbgDotNetCompilationResult(errorMessage);
 			Debug2.Assert(compileResult is not null);
@@ -525,9 +529,9 @@ namespace dnSpy.Roslyn.Debugger.ExpressionCompiler {
 				workspace.AddProject(projectInfo);
 
 				var doc = workspace.AddDocument(projectInfo.Id, "A", SourceText.From(documentText));
-				var syntaxRoot = doc.GetSyntaxRootAsync().GetAwaiter().GetResult();
-				var semanticModel = doc.GetSemanticModelAsync().GetAwaiter().GetResult();
-				var classifier = new RoslynClassifier(syntaxRoot, semanticModel, workspace, RoslynClassificationTypes.Default, null, cancellationToken);
+				var syntaxRoot = doc.GetSyntaxRootAsync(cancellationToken).GetAwaiter().GetResult();
+				var semanticModel = doc.GetSemanticModelAsync(cancellationToken).GetAwaiter().GetResult();
+				var classifier = new RoslynClassifier(syntaxRoot!, semanticModel!, workspace, RoslynClassificationTypes.Default, null, cancellationToken);
 				var textSpan = new Microsoft.CodeAnalysis.Text.TextSpan(documentTextExpressionOffset, expression.Length);
 
 				int pos = textSpan.Start;

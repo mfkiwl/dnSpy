@@ -36,19 +36,24 @@ namespace dnSpy.BamlDecompiler.Handlers {
 
 			var elemType = parent.Xaml.Element.Annotation<XamlType>();
 			var xamlProp = ctx.ResolveProperty(record.AttributeId);
-			var extType = ctx.ResolveType((ushort)-extTypeId);
+			var extType = ctx.ResolveType(unchecked((ushort)-extTypeId));
 			extType.ResolveNamespace(parent.Xaml, ctx);
 
 			var ext = new XamlExtension(extType);
 			if (valTypeExt || extTypeId == (short)KnownTypes.TypeExtension) {
 				var value = ctx.ResolveType(record.ValueId);
-				ext.Initializer = new object[] { ctx.ToString(parent.Xaml, value) };
+
+				object[] initializer = new object[] { ctx.ToString(parent.Xaml, value) };
+				if (valTypeExt)
+					initializer = new object[] { new XamlExtension(ctx.ResolveType(0xfd4d)) { Initializer = initializer } }; // Known type - TypeExtension
+
+				ext.Initializer = initializer;
 			}
 			else if (extTypeId == (short)KnownTypes.TemplateBindingExtension) {
 				var value = ctx.ResolveProperty(record.ValueId);
 
 				value.DeclaringType.ResolveNamespace(parent.Xaml, ctx);
-				var xName = value.ToXName(ctx, parent.Xaml, false);
+				var xName = value.ToXName(ctx, parent.Xaml);
 
 				ext.Initializer = new object[] { ctx.ToString(parent.Xaml, xName) };
 			}
@@ -56,7 +61,7 @@ namespace dnSpy.BamlDecompiler.Handlers {
 				string attrName;
 				if (record.ValueId > 0x7fff) {
 					bool isKey = true;
-					short bamlId = (short)-record.ValueId;
+					short bamlId = unchecked((short)-record.ValueId);
 					if (bamlId > 232 && bamlId < 464) {
 						bamlId -= 232;
 						isKey = false;
@@ -74,7 +79,7 @@ namespace dnSpy.BamlDecompiler.Handlers {
 						name = res.Item1 + "." + res.Item2;
 					else
 						name = res.Item1 + "." + res.Item3;
-					var xmlns = ctx.GetXmlNamespace("http://schemas.microsoft.com/winfx/2006/xaml/presentation");
+					var xmlns = ctx.GetXmlNamespace(XamlContext.KnownNamespace_Presentation);
 					attrName = ctx.ToString(parent.Xaml, xmlns.GetName(name));
 				}
 				else {
@@ -85,7 +90,12 @@ namespace dnSpy.BamlDecompiler.Handlers {
 
 					attrName = ctx.ToString(parent.Xaml, xName);
 				}
-				ext.Initializer = new object[] { attrName };
+
+				object[] initializer = new object[] { attrName };
+				if (valStaticExt)
+					initializer = new object[] { new XamlExtension(ctx.ResolveType(0xfda6)) { Initializer = initializer } }; // Known type - StaticExtension
+
+				ext.Initializer = initializer;
 			}
 			else {
 				ext.Initializer = new object[] { XamlUtils.Escape(ctx.ResolveString(record.ValueId)) };

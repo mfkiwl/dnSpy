@@ -32,7 +32,7 @@ namespace dnSpy.BamlDecompiler.Rewrite {
 		XName ctor;
 
 		public void Run(XamlContext ctx, XDocument document) {
-			key = ctx.GetXamlNsName("Key");
+			key = ctx.GetKnownNamespace("Key", XamlContext.KnownNamespace_Xaml);
 			ctor = ctx.GetPseudoName("Ctor");
 
 			bool doWork;
@@ -56,8 +56,14 @@ namespace dnSpy.BamlDecompiler.Rewrite {
 		bool RewriteElement(XamlContext ctx, XElement parent, XElement elem) {
 			var type = parent.Annotation<XamlType>();
 			var property = elem.Annotation<XamlProperty>();
-			if ((property is null || type is null) && elem.Name != key)
-				return false;
+
+			if (elem.Name != key) {
+				if (property is null || type is null)
+					return false;
+
+				if (property.ResolvedMember is PropertyDef propertyDef && propertyDef.SetMethod is null)
+					return false;
+			}
 
 			if (elem.Elements().Count() != 1 || elem.Attributes().Any(t => t.Name.Namespace != XNamespace.Xmlns))
 				return false;
@@ -78,8 +84,16 @@ namespace dnSpy.BamlDecompiler.Rewrite {
 			var attrName = elem.Name;
 			if (attrName != key)
 				attrName = property.ToXName(ctx, parent, property.IsAttachedTo(type));
-			var attr = new XAttribute(attrName, extValue);
-			parent.Add(attr);
+			if (!parent.Attributes(attrName).Any()) {
+				var attr = new XAttribute(attrName, extValue);
+				var list = new List<XAttribute>(parent.Attributes());
+				if (attrName == key)
+					list.Insert(0, attr);
+				else
+					list.Add(attr);
+				parent.RemoveAttributes();
+				parent.ReplaceAttributes(list);
+			}
 			elem.Remove();
 
 			return true;
