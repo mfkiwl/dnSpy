@@ -206,14 +206,17 @@ namespace dnSpy.Decompiler {
 			new SigComparer().Equals(td.BaseType, td.Module.CorLibTypes.GetTypeRef("System", "MulticastDelegate")) &&
 			td.BaseType.DefinitionAssembly.IsCorLib();
 
-		public static (PropertyDef? property, AccessorKind kind) TryGetProperty(MethodDef? method) {
+		public static (PropertyDef? property, AccessorKind kind) TryGetProperty(MethodDef? method, bool allowInitOnly) {
 			if (method is null)
 				return (null, AccessorKind.None);
 			foreach (var p in method.DeclaringType.Properties) {
 				if (method == p.GetMethod)
 					return (p, AccessorKind.Getter);
-				if (method == p.SetMethod)
+				if (method == p.SetMethod) {
+					if (allowInitOnly && method.ReturnType is CModReqdSig modReq && modReq.Modifier.FullName == "System.Runtime.CompilerServices.IsExternalInit")
+						return (p, AccessorKind.InitOnlySetter);
 					return (p, AccessorKind.Setter);
+				}
 			}
 			return (null, AccessorKind.None);
 		}
@@ -266,7 +269,8 @@ namespace dnSpy.Decompiler {
 					continue;
 				if (ca.ConstructorArguments.Count != 2)
 					return true;
-				if (!(ca.ConstructorArguments[0].Value is UTF8String s && s == ByRefLikeMarker))
+				var argument = ca.ConstructorArguments[0];
+				if (!(argument.Value is UTF8String s && s == ByRefLikeMarker || argument.Value is string s2 && s2 == ByRefLikeMarkerRaw))
 					return true;
 				if (!(ca.ConstructorArguments[1].Value is bool b && b))
 					return true;
@@ -274,11 +278,44 @@ namespace dnSpy.Decompiler {
 			}
 			return foundByRefLikeMarker && !IsByRefLike(td);
 		}
-		static readonly UTF8String ByRefLikeMarker = new UTF8String("Types with embedded references are not supported in this version of your compiler.");
+		const string ByRefLikeMarkerRaw = "This type is for compiler use only and is not intended to be used directly from your code.";
+		static readonly UTF8String ByRefLikeMarker = new UTF8String(ByRefLikeMarkerRaw);
+		const string RequiredMembersMarkerRaw = "Constructors of types with required members are not supported in this version of your compiler.";
+		static readonly UTF8String RequiredMembersMarker = new UTF8String(RequiredMembersMarkerRaw);
 
 		static bool IsDeprecated(CustomAttributeCollection customAttributes) {
+			bool foundRequiredMembersMarker = false;
 			foreach (var ca in customAttributes) {
-				if (ca.TypeFullName == "System.ObsoleteAttribute")
+				string caTypeFullName = ca.TypeFullName;
+				if (caTypeFullName == "Windows.Foundation.Metadata.DeprecatedAttribute")
+					return true;
+				if (caTypeFullName != "System.ObsoleteAttribute")
+					continue;
+				if (ca.ConstructorArguments.Count != 2)
+					return true;
+				var argument = ca.ConstructorArguments[0];
+				if (!(argument.Value is UTF8String s && s == RequiredMembersMarker || argument.Value is string s2 && s2 == RequiredMembersMarkerRaw))
+					return true;
+				if (!(ca.ConstructorArguments[1].Value is bool b && b))
+					return true;
+				foundRequiredMembersMarker = true;
+			}
+			return foundRequiredMembersMarker && !HasCompilerFeatureRequiredAttribute(customAttributes);
+		}
+
+		const string RequiredMembersRequiredFeatureRaw = "RequiredMembers";
+		static readonly UTF8String RequiredMembersRequiredFeature = new UTF8String(RequiredMembersRequiredFeatureRaw);
+
+		static bool HasCompilerFeatureRequiredAttribute(CustomAttributeCollection customAttributes) {
+			foreach (var ca in customAttributes) {
+				if (ca.TypeFullName != "System.Runtime.CompilerServices.CompilerFeatureRequiredAttribute")
+					continue;
+				if (ca.ConstructorArguments.Count != 1)
+					continue;
+				var argument = ca.ConstructorArguments[0];
+				if (argument.Value is UTF8String s && s == RequiredMembersRequiredFeature)
+					return true;
+				if (argument.Value is string s2 && s2 == RequiredMembersRequiredFeatureRaw)
 					return true;
 			}
 			return false;
@@ -505,12 +542,28 @@ namespace dnSpy.Decompiler {
 
 			return null;
 		}
+
+		public static bool HasNativeIntegerAttribute(IHasCustomAttribute? attributeProvider, int typeIndex) {
+			if (attributeProvider is null)
+				return false;
+			foreach (var a in attributeProvider.CustomAttributes) {
+				if (a.AttributeType?.FullName != "System.Runtime.CompilerServices.NativeIntegerAttribute")
+					continue;
+				if (a.ConstructorArguments.Count == 0)
+					return true;
+				if (a.ConstructorArguments.Count == 1 && a.ConstructorArguments[0].Value is IList<CAArgument> values && typeIndex < values.Count &&
+				    values[typeIndex].Value is bool b)
+					return b;
+			}
+			return false;
+		}
 	}
 
 	enum AccessorKind {
 		None,
 		Getter,
 		Setter,
+		InitOnlySetter,
 		Adder,
 		Remover,
 	}

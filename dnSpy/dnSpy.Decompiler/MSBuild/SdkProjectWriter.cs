@@ -23,7 +23,9 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Xml;
+using dnlib.DotNet;
 using dnSpy.Contracts.Decompiler;
+using dnSpy.Contracts.Utilities;
 
 namespace dnSpy.Decompiler.MSBuild {
 	sealed class SdkProjectWriter : ProjectWriterBase {
@@ -48,8 +50,10 @@ namespace dnSpy.Decompiler.MSBuild {
 			Web
 		}
 
+		readonly DotNetPathProvider dotNetPathProvider;
+
 		public SdkProjectWriter(Project project, ProjectVersion projectVersion, IList<Project> allProjects,
-			IList<string> userGACPaths) : base(project, projectVersion, allProjects, userGACPaths) { }
+			IList<string> userGACPaths) : base(project, projectVersion, allProjects, userGACPaths) => dotNetPathProvider = new DotNetPathProvider();
 
 		public override void Write() {
 			project.OnWrite();
@@ -62,7 +66,8 @@ namespace dnSpy.Decompiler.MSBuild {
 
 				writer.WriteStartElement("Project");
 
-				var projectType = GetProjectType();
+				var possibleProjectTypes = GetPossibleProjectTypes();
+				var projectType = DetermineProjectType(possibleProjectTypes);
 				writer.WriteAttributeString("Sdk", GetSdkString(projectType));
 
 				writer.WriteStartElement("PropertyGroup");
@@ -72,26 +77,31 @@ namespace dnSpy.Decompiler.MSBuild {
 				writer.WriteElementString("RootNamespace", GetRootNamespace());
 				var asmName = GetAssemblyName();
 				if (!string.IsNullOrEmpty(asmName))
-					writer.WriteElementString("AssemblyName", GetAssemblyName());
+					writer.WriteElementString("AssemblyName", asmName);
 				writer.WriteElementString("GenerateAssemblyInfo", "False");
 
 				writer.WriteElementString("FileAlignment", GetFileAlignment());
 
-				var moniker = TargetFrameworkInfo.Create(project.Module).GetTargetFrameworkMoniker();
+				var targetFrameworkInfo = TargetFrameworkInfo.Create(project.Module);
+				var moniker = targetFrameworkInfo.GetTargetFrameworkMoniker();
 				if (moniker is null)
 					throw new NotSupportedException("This assembly cannot be decompiled to a SDK style project.");
 
 				writer.WriteElementString("TargetFramework", moniker);
 
-				if (projectType == ProjectType.Wpf)
+				if (possibleProjectTypes.Contains(ProjectType.Wpf))
 					writer.WriteElementString("UseWPF", "True");
-				else if (projectType == ProjectType.WinForms)
+				if (possibleProjectTypes.Contains(ProjectType.WinForms))
 					writer.WriteElementString("UseWindowsForms", "True");
 
 				if (project.Platform != "AnyCPU")
 					writer.WriteElementString("PlatformTarget", project.Platform);
 				else if (project.Module.Is32BitPreferred)
 					writer.WriteElementString("Prefer32Bit", "True");
+
+				var noWarnList = GetNoWarnList();
+				if (noWarnList is not null)
+					writer.WriteElementString("NoWarn", noWarnList);
 
 				writer.WriteEndElement();
 
@@ -126,10 +136,7 @@ namespace dnSpy.Decompiler.MSBuild {
 						writer.WriteStartElement("ProjectReference");
 						writer.WriteAttributeString("Include", GetRelativePath(otherProj.Filename));
 						writer.WriteStartElement("Project");
-						var guidString = otherProj.Guid.ToString("B");
-						if (projectVersion < ProjectVersion.VS2012)
-							guidString = guidString.ToUpperInvariant();
-						writer.WriteString(guidString);
+						writer.WriteString(otherProj.Guid.ToString("B").ToUpperInvariant());
 						writer.WriteEndElement();
 						writer.WriteStartElement("Name");
 						writer.WriteString(IdentifierEscaper.Escape(otherProj.Module.Assembly is null ? string.Empty : otherProj.Module.Assembly.Name.String));
@@ -139,8 +146,36 @@ namespace dnSpy.Decompiler.MSBuild {
 					writer.WriteEndElement();
 				}
 
-				var gacRefs = project.Module.GetAssemblyRefs().Where(a => !implicitReferences.Contains(a.Name)).OrderBy(a => a.Name.String, StringComparer.OrdinalIgnoreCase).ToArray();
-				var extraRefsWithoutImplicitRefs = project.ExtraAssemblyReferences.Where(a => !implicitReferences.Contains(a)).ToArray();
+				bool isNetCoreApp = targetFrameworkInfo.Framework == ".NETCoreApp";
+				var netCoreVersion = isNetCoreApp ? Version.Parse(targetFrameworkInfo.Version) : null;
+				int bitness = project.Module.GetPointerSize(IntPtr.Size) * 8;
+
+				var targetPacks = new HashSet<string>();
+
+				if (isNetCoreApp) {
+					targetPacks.Add("Microsoft.NETCore.App");
+					switch (projectType) {
+					case ProjectType.WinForms:
+					case ProjectType.Wpf:
+						targetPacks.Add("Microsoft.WindowsDesktop.App");
+						break;
+					case ProjectType.Web:
+						targetPacks.Add("Microsoft.AspNetCore.App");
+						targetPacks.Add("Microsoft.AspNetCore.All");
+						break;
+					}
+				}
+
+				bool ReferenceFilter(string refName) {
+					if (isNetCoreApp)
+						return !dotNetPathProvider.TryGetRuntimePackOfAssembly(refName, netCoreVersion!, bitness, out string? runtimePack) || !targetPacks.Contains(runtimePack);
+					if (implicitReferences.Contains(refName))
+						return false;
+					return true;
+				}
+
+				var gacRefs = project.Module.GetAssemblyRefs().Where(a => ReferenceFilter(a.Name)).OrderBy(a => a.Name.String, StringComparer.OrdinalIgnoreCase).ToArray();
+				var extraRefsWithoutImplicitRefs = project.ExtraAssemblyReferences.Where(ReferenceFilter).ToArray();
 				if (gacRefs.Length > 0 || extraRefsWithoutImplicitRefs.Length > 0) {
 					writer.WriteStartElement("ItemGroup");
 					var hash = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -219,14 +254,41 @@ namespace dnSpy.Decompiler.MSBuild {
 			}
 		}
 
-		ProjectType GetProjectType() {
-			foreach (var referenceName in project.Module.GetAssemblyRefs().Select(r => r.Name)) {
-				if (referenceName.StartsWith("Microsoft.AspNetCore", StringComparison.Ordinal))
-					return ProjectType.Web;
-				if (referenceName == "PresentationFramework")
-					return ProjectType.Wpf;
-				if (referenceName == "System.Windows.Forms")
-					return ProjectType.WinForms;
+		static readonly UTF8String PresentationFrameworkString = new UTF8String("PresentationFramework");
+		static readonly UTF8String PresentationCoreString = new UTF8String("PresentationCore");
+		static readonly UTF8String WindowsBaseString = new UTF8String("WindowsBase");
+		static readonly UTF8String SystemWindowsFormsString = new UTF8String("System.Windows.Forms");
+
+		IReadOnlyCollection<ProjectType> GetPossibleProjectTypes() {
+			var hashSet = new HashSet<ProjectType>();
+
+			foreach (var assemblyRef in project.Module.GetAssemblyRefs()) {
+				if (assemblyRef.Name.StartsWith("Microsoft.AspNetCore", StringComparison.Ordinal))
+					hashSet.Add(ProjectType.Web);
+				else if (assemblyRef.Name == PresentationFrameworkString || assemblyRef.Name == PresentationCoreString ||
+						 assemblyRef.Name == WindowsBaseString)
+					hashSet.Add(ProjectType.Wpf);
+				else if (assemblyRef.Name == SystemWindowsFormsString)
+					hashSet.Add(ProjectType.WinForms);
+			}
+
+			return hashSet;
+		}
+
+		static ProjectType DetermineProjectType(IReadOnlyCollection<ProjectType> possibleProjectTypes) {
+			// If only one of the project types was detected, use it
+			if (possibleProjectTypes.Count == 1)
+				return possibleProjectTypes.Single();
+
+			ProjectType[] preferredProjectTypes = {
+				ProjectType.Wpf,
+				ProjectType.WinForms,
+				ProjectType.Web
+			};
+
+			foreach (var preferredProjectType in preferredProjectTypes) {
+				if (possibleProjectTypes.Contains(preferredProjectType))
+					return preferredProjectType;
 			}
 
 			return ProjectType.Default;
